@@ -762,12 +762,40 @@ def auto_smm_handler(c: Cardinal, e, *args):
     bot_ = c.telegram.bot
 
     if isinstance(e, NewMessageEvent):
-        if e.message.author_id == my_id:
-            return
-
         msg_text = e.message.text.strip()
         msg_author_id = e.message.author_id
         msg_chat_id = e.message.chat_id
+
+        # Обработка команд от продавца (владельца аккаунта)
+        if msg_author_id == my_id:
+            # Ищем команду вида !stopsmm XXXXXXXX (где X - буквы и цифры заказа)
+            m_stop = re.match(r'^!stopsmm\s+([a-zA-Z0-9]+)$', msg_text.lower())
+            if m_stop:
+                stop_order_id = m_stop.group(1).upper() # ID заказов на FunPay обычно заглавные
+                
+                # 1. Удаляем заказ из ожидания ссылки (если он там висит)
+                removed_from_wait = waiting_for_link.pop(str(stop_order_id), None)
+                
+                # 2. Обновляем статус в БД, чтобы фоновый чекер (start_order_checking) его игнорировал
+                orders = load_orders_data()
+                updated_db = False
+                for order in orders:
+                    if str(order["order_id"]).upper() == stop_order_id:
+                        order["status"] = "manual_stop"
+                        order["is_refunded"] = True # Ставим этот флаг, чтобы скрипт забыл про него
+                        updated_db = True
+                        break
+                
+                if updated_db:
+                    save_orders_data(orders)
+                
+                if removed_from_wait or updated_db:
+                    c.send_message(msg_chat_id, f"🛑 Бот: Автоматическая накрутка для заказа #{stop_order_id} остановлена. Переведено в ручной режим.")
+                else:
+                    c.send_message(msg_chat_id, f"⚠️ Бот: Заказ #{stop_order_id} не найден в активных процессах.")
+            
+            # Важно завершить выполнение, чтобы бот не реагировал на твои обычные сообщения как покупатель
+            return
 
         logger.info(f"Новое сообщение от {e.message.author}: {msg_text}")
 
@@ -870,7 +898,13 @@ def auto_smm_handler(c: Cardinal, e, *args):
                         c.send_message(msg_chat_id, "❌ Подтверждение отклонено. Введите другую ссылку.")
                         return
                     else:
-                        c.send_message(msg_chat_id, "❌ Используйте + или -. Повторите.")
+                        # Обновленный текст при ошибке
+                        error_msg = (
+                            "❌ Используйте + или -. Повторите.\n\n"
+                            "Если возникает какая-то ошибка, ссылка не принимается, или нужна помощь — "
+                            "напишите в чат команду !продавец, и я подойду при первой возможности."
+                        )
+                        c.send_message(msg_chat_id, error_msg)
                         return
 
     elif isinstance(e, NewOrderEvent):
