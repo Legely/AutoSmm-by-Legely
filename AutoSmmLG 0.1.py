@@ -10,6 +10,11 @@ import json
 import logging
 import threading
 import requests
+
+# A global lock for all shared state modifications (files and dicts)
+# Using RLock to allow a thread to re-acquire the lock
+STATE_LOCK = threading.RLock()
+
 import shutil
 import time
 import io
@@ -93,22 +98,24 @@ def save_valid_links(links: List[str]):
         json.dump(links, f, ensure_ascii=False, indent=4)
 
 def add_website(message: types.Message, new_site: str):
-    valid_links = load_valid_links()
-    if new_site not in valid_links:
-        valid_links.append(new_site)
-        save_valid_links(valid_links)
-        bot.send_message(message.chat.id, f"✅ Сайт {new_site} успешно добавлен в список.")
-    else:
-        bot.send_message(message.chat.id, f"❌ Сайт {new_site} уже есть в списке.")
+    with STATE_LOCK:
+        valid_links = load_valid_links()
+        if new_site not in valid_links:
+            valid_links.append(new_site)
+            save_valid_links(valid_links)
+            bot.send_message(message.chat.id, f"✅ Сайт {new_site} успешно добавлен в список.")
+        else:
+            bot.send_message(message.chat.id, f"❌ Сайт {new_site} уже есть в списке.")
 
 def remove_website(message: types.Message, site_to_remove: str):
-    valid_links = load_valid_links()
-    if site_to_remove in valid_links:
-        valid_links.remove(site_to_remove)
-        save_valid_links(valid_links)
-        bot.send_message(message.chat.id, f"✅ Сайт {site_to_remove} успешно удалён из списка.")
-    else:
-        bot.send_message(message.chat.id, f"❌ Сайт {site_to_remove} не найден в списке.")
+    with STATE_LOCK:
+        valid_links = load_valid_links()
+        if site_to_remove in valid_links:
+            valid_links.remove(site_to_remove)
+            save_valid_links(valid_links)
+            bot.send_message(message.chat.id, f"✅ Сайт {site_to_remove} успешно удалён из списка.")
+        else:
+            bot.send_message(message.chat.id, f"❌ Сайт {site_to_remove} не найден в списке.")
 
 LOG_DIR = os.path.join("storage", "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -148,10 +155,8 @@ os.makedirs(os.path.dirname(ORDERS_DATA_PATH), exist_ok=True)
 def load_config() -> Dict:
     logger.info("Загрузка конфигурации (auto_lots.json)...")
     
-    file_lock = threading.Lock()
-    
     try:
-        with file_lock:
+        with STATE_LOCK:
             if os.path.exists(CONFIG_PATH):
                 try:
                     with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
@@ -249,9 +254,10 @@ def create_default_config() -> Dict:
 def save_config(cfg: Dict):
     logger.info("Сохранение конфигурации (auto_lots.json)...")
     os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=4)
-    logger.info("Конфигурация сохранена.")
+    with STATE_LOCK:
+        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=4)
+        logger.info("Конфигурация сохранена.")
 
 def reindex_lots(cfg: Dict):
     lot_map = cfg.get("lot_mapping", {})
@@ -343,18 +349,14 @@ def save_order_data(
         "summa": chistota,
         "currency": "RUB"
     }
-    
-    orders = load_orders_data()
-    
-    orders.append(data_)
-    
-    save_orders_data(orders)
+    with STATE_LOCK:
+        orders = load_orders_data()
+        orders.append(data_)
+        save_orders_data(orders)
     
     logger.info(f"Данные заказа #{order_id} (twiboost ID: {twiboost_id}) сохранены.")
 
 def save_order_info(order_id: int, order_summa: float, service_name: str, order_chistota: float):
-    file_lock = threading.Lock()
-    
     data_ = {
         "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "order_id": order_id,
@@ -365,7 +367,7 @@ def save_order_info(order_id: int, order_summa: float, service_name: str, order_
     }
     
     try:
-        with file_lock:
+        with STATE_LOCK:
             if not os.path.exists(ORDERS_PATH):
                 os.makedirs(os.path.dirname(ORDERS_PATH), exist_ok=True)
                 with open(ORDERS_PATH, 'w', encoding='utf-8') as f:
@@ -405,36 +407,38 @@ def save_order_info(order_id: int, order_summa: float, service_name: str, order_
         logger.error(f"Общая ошибка при сохранении информации о заказе #{order_id}: {e}")
 
 def update_order_status(order_id_funpay: str, new_status: str):
-    orders = load_orders_data()
-    updated = False
+    with STATE_LOCK:
+        orders = load_orders_data()
+        updated = False
 
-    for order in orders:
-        if str(order["order_id"]) == str(order_id_funpay):
-            order["status"] = new_status
-            updated = True
-            logger.info(f"Статус заказа #{order_id_funpay} обновлён на '{new_status}'.")
-            break
+        for order in orders:
+            if str(order["order_id"]) == str(order_id_funpay):
+                order["status"] = new_status
+                updated = True
+                logger.info(f"Статус заказа #{order_id_funpay} обновлён на '{new_status}'.")
+                break
 
-    if updated:
-        save_orders_data(orders)
-    else:
-        logger.warning(f"Заказ #{order_id_funpay} не найден в orders_data.json.")
+        if updated:
+            save_orders_data(orders)
+        else:
+            logger.warning(f"Заказ #{order_id_funpay} не найден в orders_data.json.")
 
 def update_order_refunded_status(order_id_funpay: str):
-    orders = load_orders_data()
-    updated = False
-    for order in orders:
-        if str(order["order_id"]) == str(order_id_funpay):
-            if not order.get("is_refunded", False):
-                order["is_refunded"] = True
-                updated = True
-                logger.info(f"Статус заказа #{order_id_funpay} обновлён на 'is_refunded': True.")
-            break
+    with STATE_LOCK:
+        orders = load_orders_data()
+        updated = False
+        for order in orders:
+            if str(order["order_id"]) == str(order_id_funpay):
+                if not order.get("is_refunded", False):
+                    order["is_refunded"] = True
+                    updated = True
+                    logger.info(f"Статус заказа #{order_id_funpay} обновлён на 'is_refunded': True.")
+                break
 
-    if updated:
-        save_orders_data(orders)
-    else:
-        logger.warning(f"Заказ #{order_id_funpay} не найден или уже отмечен как 'is_refunded'.")
+        if updated:
+            save_orders_data(orders)
+        else:
+            logger.warning(f"Заказ #{order_id_funpay} не найден или уже отмечен как 'is_refunded'.")
 
 def refund_order(c: Cardinal, order_id_funpay: str, buyer_chat_id: int, reason: str, detailed_reason: str = None):
     """
@@ -470,7 +474,8 @@ def refund_order(c: Cardinal, order_id_funpay: str, buyer_chat_id: int, reason: 
                 bot.send_message(notification_chat_id, detailed_message)
             logger.info(f"Заказ #{order_id_funpay} был отменён (refund) для покупателя {buyer_chat_id}. Причина: {reason}")
 
-            waiting_for_link.pop(str(order_id_funpay), None)
+            with STATE_LOCK:
+                waiting_for_link.pop(str(order_id_funpay), None)
         except Exception as ex:
             logger.error(f"Не удалось вернуть средства для заказа #{order_id_funpay}: {ex}")
             if notification_chat_id:
@@ -496,42 +501,43 @@ def refund_order(c: Cardinal, order_id_funpay: str, buyer_chat_id: int, reason: 
 
 
 def update_order_charge_and_net(order_id_funpay: str, spent: float, currency: str = "USD", net_profit: float = None):
-    orders_data = load_orders_data()
-    found_od = False
-    for order in orders_data:
-        if str(order["order_id"]) == str(order_id_funpay):
-            order["spent"] = spent
-            order["currency"] = currency
-            if net_profit is not None:
-                order["chistota"] = net_profit
-            else:
-                net = order["summa"] - spent
-                order["chistota"] = round(net, 2)
-            found_od = True
-            break
-
-    if found_od:
-        save_orders_data(orders_data)
-
-    if os.path.exists(ORDERS_PATH):
-        with open(ORDERS_PATH, 'r', encoding='utf-8') as f:
-            orders_list = json.load(f)
-        updated_a = False
-        for o in orders_list:
-            if str(o["order_id"]) == str(order_id_funpay):
-                o["spent"] = spent
-                o["currency"] = currency
+    with STATE_LOCK:
+        orders_data = load_orders_data()
+        found_od = False
+        for order in orders_data:
+            if str(order["order_id"]) == str(order_id_funpay):
+                order["spent"] = spent
+                order["currency"] = currency
                 if net_profit is not None:
-                    o["chistota"] = net_profit
+                    order["chistota"] = net_profit
                 else:
-                    net = o["summa"] - spent
-                    o["chistota"] = round(net, 2)
-                updated_a = True
+                    net = order["summa"] - spent
+                    order["chistota"] = round(net, 2)
+                found_od = True
                 break
 
-        if updated_a:
-            with open(ORDERS_PATH, 'w', encoding='utf-8') as f:
-                json.dump(orders_list, f, indent=4, ensure_ascii=False)
+        if found_od:
+            save_orders_data(orders_data)
+
+        if os.path.exists(ORDERS_PATH):
+            with open(ORDERS_PATH, 'r', encoding='utf-8') as f:
+                orders_list = json.load(f)
+            updated_a = False
+            for o in orders_list:
+                if str(o["order_id"]) == str(order_id_funpay):
+                    o["spent"] = spent
+                    o["currency"] = currency
+                    if net_profit is not None:
+                        o["chistota"] = net_profit
+                    else:
+                        net = o["summa"] - spent
+                        o["chistota"] = round(net, 2)
+                    updated_a = True
+                    break
+
+            if updated_a:
+                with open(ORDERS_PATH, 'w', encoding='utf-8') as f:
+                    json.dump(orders_list, f, indent=4, ensure_ascii=False)
 
 def check_order_status(
     c: Cardinal,
@@ -544,10 +550,8 @@ def check_order_status(
     """
     Потоковая проверка статуса заказа на соответствующем SMM-сервисе.
     """
-    file_lock = threading.Lock()
-    
     try:
-        with file_lock:
+        with STATE_LOCK:
             if os.path.exists(ORDERS_PATH):
                 try:
                     with open(ORDERS_PATH, 'r', encoding='utf-8') as f:
@@ -628,7 +632,7 @@ def check_order_status(
             if status_lower in completed_statuses or (remains_ is not None and remains_ == 0):
                 if order_info:
                     try:
-                        with file_lock:
+                        with STATE_LOCK:
                             order_info["completed_notification_sent"] = True
                             with open(ORDERS_PATH, 'w', encoding='utf-8') as f:
                                 json.dump(orders_info, f, indent=4, ensure_ascii=False)
@@ -693,10 +697,9 @@ def start_order_checking(c: Cardinal):
             all_data = []
         
         orders_info_data = []
-        file_lock = threading.Lock()
         
         try:
-            with file_lock:
+            with STATE_LOCK:
                 if os.path.exists(ORDERS_PATH):
                     try:
                         with open(ORDERS_PATH, 'r', encoding='utf-8') as f:
@@ -772,23 +775,27 @@ def auto_smm_handler(c: Cardinal, e, *args):
             m_stop = re.match(r'^!stopsmm\s+([a-zA-Z0-9]+)$', msg_text.lower())
             if m_stop:
                 stop_order_id = m_stop.group(1).upper() # ID заказов на FunPay обычно заглавные
-                
-                # 1. Удаляем заказ из ожидания ссылки (если он там висит)
-                removed_from_wait = waiting_for_link.pop(str(stop_order_id), None)
-                
-                # 2. Обновляем статус в БД, чтобы фоновый чекер (start_order_checking) его игнорировал
-                orders = load_orders_data()
+
+                removed_from_wait = False
+                with STATE_LOCK:
+                    # 1. Удаляем заказ из ожидания ссылки (если он там висит)
+                    if waiting_for_link.pop(str(stop_order_id), None):
+                        removed_from_wait = True
+
                 updated_db = False
-                for order in orders:
-                    if str(order["order_id"]).upper() == stop_order_id:
-                        order["status"] = "manual_stop"
-                        order["is_refunded"] = True # Ставим этот флаг, чтобы скрипт забыл про него
-                        updated_db = True
-                        break
-                
-                if updated_db:
-                    save_orders_data(orders)
-                
+                with STATE_LOCK:
+                    # 2. Обновляем статус в БД, чтобы фоновый чекер (start_order_checking) его игнорировал
+                    orders = load_orders_data()
+                    for order in orders:
+                        if str(order["order_id"]).upper() == stop_order_id:
+                            order["status"] = "manual_stop"
+                            order["is_refunded"] = True # Ставим этот флаг, чтобы скрипт забыл про него
+                            updated_db = True
+                            break
+
+                    if updated_db:
+                        save_orders_data(orders)
+
                 if removed_from_wait or updated_db:
                     c.send_message(msg_chat_id, f"🛑 Бот: Автоматическая накрутка для заказа #{stop_order_id} остановлена. Переведено в ручной режим.")
                 else:
@@ -858,54 +865,56 @@ def auto_smm_handler(c: Cardinal, e, *args):
                 c.send_message(msg_chat_id, f"Ошибка при запросе рефилла")
             return
 
-# Оборачиваем в list(), чтобы избежать ошибки изменения словаря во время цикла
-        for order_id, data in list(waiting_for_link.items()):
-            if data["buyer_id"] == msg_author_id:
-                if data["step"] == "await_link":
-                    link_m = re.search(r'(https?://\S+)', msg_text)
-                    if not link_m:
-                        c.send_message(msg_chat_id, "❌ Неверная ссылка, повторите...")
-                        return
-                    
-                    link_ = link_m.group(0)
-                    ok, reason = is_valid_link(link_)
-                    if not ok:
-                        c.send_message(msg_chat_id, reason)
-                        return
+        # Блокируем доступ к общим данным для предотвращения гонок состояний
+        with STATE_LOCK:
+            # Оборачиваем в list(), чтобы избежать ошибки изменения словаря во время цикла
+            for order_id, data in list(waiting_for_link.items()):
+                if data["buyer_id"] == msg_author_id:
+                    if data["step"] == "await_link":
+                        link_m = re.search(r'(https?://\S+)', msg_text)
+                        if not link_m:
+                            c.send_message(msg_chat_id, "❌ Неверная ссылка, повторите...")
+                            return
                         
-                    data["link"] = link_
-                    
-                    cfg = load_config()
-                    confirm_link = cfg.get("confirm_link", True)
-                    
-                    if confirm_link:
-                        data["step"] = "await_confirm"
-                        c.send_message(msg_chat_id, f"✅ Ссылка принята: {link_}\nПодтвердите: + / -")
+                        link_ = link_m.group(0)
+                        ok, reason = is_valid_link(link_)
+                        if not ok:
+                            c.send_message(msg_chat_id, reason)
+                            return
+                            
+                        data["link"] = link_
+                        
+                        cfg = load_config()
+                        confirm_link = cfg.get("confirm_link", True)
+                        
+                        if confirm_link:
+                            data["step"] = "await_confirm"
+                            c.send_message(msg_chat_id, f"✅ Ссылка принята: {link_}\nПодтвердите: + / -")
+                            return
+                        else:
+                            process_link_without_confirmation(c, data)
                         return
-                    else:
-                        process_link_without_confirmation(c, data)
-                    return
 
-                elif data["step"] == "await_confirm":
-                    # Смягчаем проверку: убираем лишние пробелы и проверяем только первый символ
-                    cleaned_text = msg_text.strip().lower()
-                    
-                    if cleaned_text.startswith("+"):
-                        process_link_without_confirmation(c, data)
-                        return
-                    elif cleaned_text.startswith("-"):
-                        data["step"] = "await_link"
-                        c.send_message(msg_chat_id, "❌ Подтверждение отклонено. Введите другую ссылку.")
-                        return
-                    else:
-                        # Обновленный текст при ошибке
-                        error_msg = (
-                            "❌ Используйте + или -. Повторите.\n\n"
-                            "Если возникает какая-то ошибка, ссылка не принимается, или нужна помощь — "
-                            "напишите в чат команду !продавец, и я подойду при первой возможности."
-                        )
-                        c.send_message(msg_chat_id, error_msg)
-                        return
+                    elif data["step"] == "await_confirm":
+                        # Смягчаем проверку: убираем лишние пробелы и проверяем только первый символ
+                        cleaned_text = msg_text.strip().lower()
+                        
+                        if cleaned_text.startswith("+"):
+                            process_link_without_confirmation(c, data)
+                            return
+                        elif cleaned_text.startswith("-"):
+                            data["step"] = "await_link"
+                            c.send_message(msg_chat_id, "❌ Подтверждение отклонено. Введите другую ссылку.")
+                            return
+                        else:
+                            # Обновленный текст при ошибке
+                            error_msg = (
+                                "❌ Используйте + или -. Повторите.\n\n"
+                                "Если возникает какая-то ошибка, ссылка не принимается, или нужна помощь — "
+                                "напишите в чат команду !продавец, и я подойду при первой возможности."
+                            )
+                            c.send_message(msg_chat_id, error_msg)
+                            return
 
     elif isinstance(e, NewOrderEvent):
         order_ = e.order
@@ -949,16 +958,17 @@ def auto_smm_handler(c: Cardinal, e, *args):
         
         c.send_message(buyer_chat_id, msg_payment)
 
-        waiting_for_link[str(orderID)] = {
-            "buyer_id": buyer_id,
-            "chat_id": buyer_chat_id,
-            "service_id": service_id,
-            "real_amount": real_amount,
-            "order_id_funpay": orderID,
-            "price": orderPrice,
-            "service_number": srv_number,
-            "step": "await_link"
-        }
+        with STATE_LOCK:
+            waiting_for_link[str(orderID)] = {
+                "buyer_id": buyer_id,
+                "chat_id": buyer_chat_id,
+                "service_id": service_id,
+                "real_amount": real_amount,
+                "order_id_funpay": orderID,
+                "price": orderPrice,
+                "service_number": srv_number,
+                "step": "await_link"
+            }
 
 def start_smm(message: types.Message):
     global RUNNING, IS_STARTED, ORDER_CHECK_THREAD, AUTO_LOTS_SEND_THREAD, cardinal_instance
@@ -2553,7 +2563,8 @@ def process_link_without_confirmation(c: Cardinal, data: Dict):
                 link=link_
             )
             c.send_message(buyer_chat_id, msg_confirmation)
-            waiting_for_link.pop(str(order_id_funpay), None)
+            with STATE_LOCK:
+                waiting_for_link.pop(str(order_id_funpay), None)
         else:
             logger.error(f"Нет 'order' в ответе: {j_}")
             refund_order(
